@@ -1,0 +1,10 @@
+[
+  {
+    "task": "Take out rubbish",
+    "is_done": false
+  },
+  {
+    "task": "Clean room",
+    "is_done": true
+  }
+]

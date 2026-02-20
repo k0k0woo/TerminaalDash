@@ -1,0 +1,16 @@
+[package]
+name = "sysMonitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+rand = { version = "0.10.0", features = ["std"] }
+ratatui = {version = "0.30.0",features = ["all-widgets"]}
+tokio = { version = "1.36", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dotenvy = "0.15"
+chrono = "0.4"
+rss = "2.0"
