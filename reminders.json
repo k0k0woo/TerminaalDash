@@ -1,10 +1,10 @@
 [
   {
     "task": "Take out rubbish",
-    "is_done": false
+    "is_done": true
   },
   {
     "task": "Clean room",
-    "is_done": true
+    "is_done": false
   }
 ]
