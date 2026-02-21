@@ -9,8 +9,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    widgets::{Block, BorderType, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Widget},
+    widgets::{Block, BorderType, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Widget, Wrap},
     Frame, Terminal,
+    text::{Line, Span}
 };
 use rand::{Rng, RngExt};
 use chrono::Local;
@@ -42,6 +43,25 @@ struct StockOverviewData {
     chart_data: Vec<f64>,
 }
 
+#[derive(Clone, Default)]
+struct DetailedTickerData {
+    symbol: String,
+    company_name: String,
+    description: String,
+    industry: String,
+    sector: String,
+    price: f64,
+    change: f64,          // Added for the chart title
+    change_percent: f64,  // Added for the chart title
+    market_cap: String,
+    pe_ratio: String,
+    analyst_rating: String,
+    chart_data: Vec<f64>, // Added for the chart
+    is_loading: bool,
+    related_tickers: Vec<String>,
+    ticker_news: Vec<String>,
+}
+
 enum AppEvent {
     UpdateStock(String),
     UpdateWeather(String, WeatherCondition),
@@ -49,16 +69,12 @@ enum AppEvent {
     UpdateGithub(String),
     UpdateNews(String),
     UpdateStockOverview(StockOverviewData),
+    UpdateDetailedTicker(DetailedTickerData),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WeatherCondition {
-    Clear,
-    Clouds,
-    Rain,
-    Storm,
-    Snow,
-    Unknown,
+    Clear, Clouds, Rain, Storm, Snow, Unknown,
 }
 
 enum Action {
@@ -84,6 +100,7 @@ enum InputMode {
     AddingReminder,
     AddingScheduleTime,
     AddingScheduleActivity,
+    SearchingTicker,
 }
 
 struct App {
@@ -99,24 +116,45 @@ struct App {
     time_text: String,
     github_text: String,
     news_text: String,
-    stock_overview_data: StockOverviewData,
+    stock_overview_list: Vec<StockOverviewData>, // UPDATED HERE
+    detailed_ticker_data: DetailedTickerData,
     schedule: Vec<ScheduleItem>,
     schedule_index: usize,
     reminders: Vec<ReminderItem>,
     reminder_index: usize,
     time_rect: Rect, stock_rect: Rect, weather_rect: Rect, stock_overview_rect: Rect, github_rect: Rect,
     news_rect: Rect, schedule_rect: Rect, reminders_rect: Rect,
+    tx: Option<mpsc::Sender<AppEvent>>, // Used to spawn on-demand tasks
+}
+
+fn load_json<T: Default + serde::de::DeserializeOwned>(path: &str) -> T {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+async fn get_yahoo_auth() -> Result<(reqwest::Client, String), Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .cookie_store(true) 
+        .build()?;
+    let _ = client.get("https://fc.yahoo.com").send().await?;
+    let crumb = client
+        .get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+        .send()
+        .await?
+        .text()
+        .await?;
+    Ok((client, crumb))
 }
 
 impl App {
-    fn new() -> Self {
-        let mut schedule: Vec<ScheduleItem> = serde_json::from_str(&std::fs::read_to_string("schedule.json").unwrap_or_else(|_| "[]".to_string())).unwrap_or_default();
-        schedule.sort_by(|a, b| a.time.cmp(&b.time)); // Auto-sort on load
+    fn new(tx: mpsc::Sender<AppEvent>) -> Self {
+        let mut schedule: Vec<ScheduleItem> = load_json("schedule.json");
+        schedule.sort_by(|a, b| a.time.cmp(&b.time));
         
-        let reminders = serde_json::from_str(&std::fs::read_to_string("reminders.json").unwrap_or_else(|_| "[]".to_string())).unwrap_or_default();
-        
-        let mut default_overview = StockOverviewData::default();
-        default_overview.symbol = "Loading...".to_string();
+        let reminders = load_json("reminders.json");
 
         Self {
             focused_screen: FocusedScreen::Dashboard,
@@ -131,7 +169,8 @@ impl App {
             time_text: "Loading...".to_string(),
             github_text: "\nLoading GitHub...".to_string(),
             news_text: "\nLoading RSS Feeds...".to_string(),
-            stock_overview_data: default_overview,
+            stock_overview_list: Vec::new(), // FIX 1: Initialized the list correctly
+            detailed_ticker_data: DetailedTickerData::default(),
             schedule,
             schedule_index: 0,
             reminders,
@@ -139,6 +178,7 @@ impl App {
             time_rect: Rect::default(), stock_rect: Rect::default(), weather_rect: Rect::default(),
             stock_overview_rect: Rect::default(), github_rect: Rect::default(), news_rect: Rect::default(), 
             schedule_rect: Rect::default(), reminders_rect: Rect::default(),
+            tx: Some(tx),
         }
     }
 
@@ -149,7 +189,7 @@ impl App {
     }
 
     fn save_schedule(&mut self) {
-        self.schedule.sort_by(|a, b| a.time.cmp(&b.time)); // Keep chronological
+        self.schedule.sort_by(|a, b| a.time.cmp(&b.time)); 
         if let Ok(json) = serde_json::to_string_pretty(&self.schedule) {
             let _ = std::fs::write("schedule.json", json);
         }
@@ -272,24 +312,16 @@ async fn fetch_news_data(tx: mpsc::Sender<AppEvent>) {
         "https://news.ycombinator.com/rss",
         "https://feeds.bbci.co.uk/news/rss.xml"
     ];
-    
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()
-        .unwrap_or_default();
-
+    let client = reqwest::Client::builder().user_agent("Mozilla/5.0").build().unwrap_or_default();
     loop {
         let mut headlines = Vec::new();
         for url in &feeds {
             if let Ok(res) = client.get(*url).send().await {
                 if let Ok(bytes) = res.bytes().await {
                     if let Ok(channel) = rss::Channel::read_from(&bytes[..]) {
-                        // 1. Get the channel name (e.g., "BBC News - World")
                         let channel_name = channel.title().split('-').next().unwrap_or("News").trim();
-
-                        for item in channel.items().iter().take(2) {
+                        for item in channel.items().iter().take(7) {
                             if let Some(title) = item.title() { 
-                                // 2. Format as "Source: Title"
                                 headlines.push(format!("• {}: {}", channel_name, title)); 
                             }
                         }
@@ -301,6 +333,7 @@ async fn fetch_news_data(tx: mpsc::Sender<AppEvent>) {
         tokio::time::sleep(Duration::from_secs(1200)).await;
     }
 }
+
 async fn fetch_github_data(tx: mpsc::Sender<AppEvent>) {
     dotenvy::dotenv().ok();
     let username = std::env::var("GITHUB_USERNAME").unwrap_or_else(|_| "torvalds".to_string());
@@ -327,16 +360,11 @@ async fn fetch_github_data(tx: mpsc::Sender<AppEvent>) {
 }
 
 async fn fetch_stock_data(tx: mpsc::Sender<AppEvent>) {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()
-        .unwrap_or_default();
-
+    let client = reqwest::Client::builder().user_agent("Mozilla/5.0").build().unwrap_or_default();
     loop {
         let file_contents = tokio::fs::read_to_string("stocks.txt").await.unwrap_or_else(|_| "AAPL".to_string());
         let symbols: Vec<&str> = file_contents.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         let mut ticker_parts = Vec::new();
-        
         for symbol in &symbols {
             let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d", symbol);
             if let Ok(res) = client.get(&url).send().await {
@@ -344,17 +372,14 @@ async fn fetch_stock_data(tx: mpsc::Sender<AppEvent>) {
                     if let Some(meta) = json["chart"]["result"][0]["meta"].as_object() {
                         let price = meta.get("regularMarketPrice").and_then(|p| p.as_f64()).unwrap_or(0.0);
                         let prev_close = meta.get("chartPreviousClose").and_then(|p| p.as_f64()).unwrap_or(price);
-                        
                         let change_percent = if prev_close > 0.0 { ((price - prev_close) / prev_close) * 100.0 } else { 0.0 };
                         let sign = if change_percent >= 0.0 { "+" } else { "" };
-                        
                         ticker_parts.push(format!("{} ${:.2} ({}{:.2}%)", symbol, price, sign, change_percent));
                     }
                 }
             }
             tokio::time::sleep(Duration::from_millis(2000)).await;
         }
-        
         if !ticker_parts.is_empty() {
             let _ = tx.send(AppEvent::UpdateStock(format!("   •   {}   •   ", ticker_parts.join("   •   "))));
         }
@@ -363,64 +388,132 @@ async fn fetch_stock_data(tx: mpsc::Sender<AppEvent>) {
 }
 
 async fn fetch_stock_overview_data(tx: mpsc::Sender<AppEvent>) {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()
-        .unwrap_or_default();
-
     loop {
-        let file_contents = tokio::fs::read_to_string("stocks.txt").await.unwrap_or_else(|_| "AAPL".to_string());
-        let symbols: Vec<&str> = file_contents.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        
-        if symbols.is_empty() {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            continue;
-        }
-
-        for symbol in symbols {
-            let mut overview = StockOverviewData {
-                symbol: symbol.to_string(),
-                company_name: symbol.to_string(),
-                ..Default::default()
-            };
-
-            let chart_url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=15m&range=5d", symbol);
+        if let Ok((client, crumb)) = get_yahoo_auth().await {
+            let file_contents = tokio::fs::read_to_string("stocks.txt").await.unwrap_or_else(|_| "AAPL".to_string());
+            let symbols: Vec<&str> = file_contents.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             
-            if let Ok(res) = client.get(&chart_url).send().await {
-                if let Ok(json) = res.json::<serde_json::Value>().await {
-                    
-                    if let Some(close_prices) = json["chart"]["result"][0]["indicators"]["quote"][0]["close"].as_array() {
-                        let mut recent_prices: Vec<f64> = close_prices.iter().filter_map(|v| v.as_f64()).collect();
-                        if recent_prices.len() > 50 {
-                            recent_prices = recent_prices[recent_prices.len() - 50..].to_vec();
-                        }
-                        overview.chart_data = recent_prices;
-                    }
+            if symbols.is_empty() { 
+                tokio::time::sleep(Duration::from_secs(60)).await; 
+                continue; 
+            }
 
-                    if let Some(meta) = json["chart"]["result"][0]["meta"].as_object() {
-                        if let Some(name) = meta.get("shortName").and_then(|n| n.as_str()) {
-                            overview.company_name = name.to_string();
+            for symbol in symbols {
+                let mut overview = StockOverviewData { symbol: symbol.to_string(), company_name: symbol.to_string(), ..Default::default() };
+                
+                let chart_url = format!(
+                    "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=15m&range=5d&crumb={}", 
+                    symbol, crumb
+                );
+
+                if let Ok(res) = client.get(&chart_url).send().await {
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        if let Some(close_prices) = json["chart"]["result"][0]["indicators"]["quote"][0]["close"].as_array() {
+                            let mut recent_prices: Vec<f64> = close_prices.iter().filter_map(|v| v.as_f64()).collect();
+                            if recent_prices.len() > 50 { recent_prices = recent_prices[recent_prices.len() - 50..].to_vec(); }
+                            overview.chart_data = recent_prices;
                         }
-                        
-                        let price = meta.get("regularMarketPrice").and_then(|p| p.as_f64()).unwrap_or(0.0);
-                        let prev_close = meta.get("chartPreviousClose").and_then(|p| p.as_f64()).unwrap_or(price);
-                        
-                        overview.price = price;
-                        overview.change = price - prev_close;
-                        if prev_close > 0.0 {
-                            overview.change_percent = (overview.change / prev_close) * 100.0;
+                        if let Some(meta) = json["chart"]["result"][0]["meta"].as_object() {
+                            if let Some(name) = meta.get("shortName").and_then(|n| n.as_str()) { overview.company_name = name.to_string(); }
+                            let price = meta.get("regularMarketPrice").and_then(|p| p.as_f64()).unwrap_or(0.0);
+                            let prev_close = meta.get("chartPreviousClose").and_then(|p| p.as_f64()).unwrap_or(price);
+                            overview.price = price; 
+                            overview.change = price - prev_close;
+                            if prev_close > 0.0 { overview.change_percent = (overview.change / prev_close) * 100.0; }
                         }
-                        overview.market_cap = "N/A".to_string(); 
+                    }
+                }
+                let _ = tx.send(AppEvent::UpdateStockOverview(overview));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(300)).await;
+    }
+}async fn fetch_detailed_ticker(symbol: String, tx: mpsc::Sender<AppEvent>) {
+    let mut data = DetailedTickerData {
+        symbol: symbol.to_uppercase(),
+        is_loading: false,
+        ..Default::default()
+    };
+
+    if let Ok((client, crumb)) = get_yahoo_auth().await {
+        // 1. Primary Data
+        let summary_url = format!(
+            "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{}?modules=assetProfile,summaryDetail,financialData&crumb={}", 
+            symbol, crumb
+        );
+        
+        // 2. NEW: Dedicated News Endpoint (Much more reliable)
+        let news_url = format!(
+            "https://query2.finance.yahoo.com/v1/finance/search?q={}&newsCount=3", 
+            symbol
+        );
+
+        // Fetch Summary (Profile/Financials)
+        if let Ok(res) = client.get(&summary_url).send().await {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if let Some(result) = json["quoteSummary"]["result"].as_array().and_then(|arr| arr.get(0)) {
+                    if let Some(profile) = result.get("assetProfile") {
+                        data.description = profile["longBusinessSummary"].as_str().unwrap_or("No description.").to_string();
+                        data.industry = profile["industry"].as_str().unwrap_or("N/A").to_string();
+                        data.sector = profile["sector"].as_str().unwrap_or("N/A").to_string();
+                    }
+                    if let Some(fin) = result.get("financialData") {
+                        data.price = fin["currentPrice"]["raw"].as_f64().unwrap_or(0.0);
+                        data.analyst_rating = fin["recommendationKey"].as_str().unwrap_or("N/A").to_string().replace('_', " ").to_uppercase();
+                    }
+                    if let Some(summary) = result.get("summaryDetail") {
+                        data.market_cap = summary["marketCap"]["fmt"].as_str().unwrap_or("N/A").to_string();
+                        data.pe_ratio = summary["forwardPE"]["fmt"].as_str().unwrap_or("N/A").to_string();
                     }
                 }
             }
+        }
 
-            let _ = tx.send(AppEvent::UpdateStockOverview(overview));
-            tokio::time::sleep(Duration::from_secs(30)).await;
+        // Fetch News from Search Endpoint
+        if let Ok(res) = client.get(&news_url).send().await {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if let Some(news_items) = json["news"].as_array() {
+                    data.ticker_news = news_items.iter()
+                        .filter_map(|item| item["title"].as_str())
+                        .map(|s| s.to_string())
+                        .collect();
+                }
+            }
+        }
+
+        // 3. Related Tickers (v6)
+        let rec_url = format!("https://query2.finance.yahoo.com/v6/finance/recommendationsbysymbol/{}?crumb={}", symbol, crumb);
+        if let Ok(res) = client.get(&rec_url).send().await {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if let Some(recommended) = json["finance"]["result"][0]["recommendedSymbols"].as_array() {
+                    data.related_tickers = recommended.iter().filter_map(|s| s["symbol"].as_str()).map(|s| s.to_string()).take(5).collect();
+                }
+            }
+        }
+
+        // 4. Chart Data
+        let chart_url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=15m&range=5d&crumb={}", symbol, crumb);
+        if let Ok(res) = client.get(&chart_url).header("User-Agent", "Mozilla/5.0").send().await {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if let Some(close_prices) = json["chart"]["result"][0]["indicators"]["quote"][0]["close"].as_array() {
+                    let mut recent_prices: Vec<f64> = close_prices.iter().filter_map(|v| v.as_f64()).collect();
+                    if recent_prices.len() > 50 { recent_prices = recent_prices[recent_prices.len() - 50..].to_vec(); }
+                    data.chart_data = recent_prices;
+                }
+                if let Some(meta) = json["chart"]["result"][0]["meta"].as_object() {
+                    let price = meta.get("regularMarketPrice").and_then(|p| p.as_f64()).unwrap_or(data.price);
+                    let prev_close = meta.get("chartPreviousClose").and_then(|p| p.as_f64()).unwrap_or(price);
+                    data.change = price - prev_close;
+                    if prev_close > 0.0 { data.change_percent = (data.change / prev_close) * 100.0; }
+                }
+            }
         }
     }
+    let _ = tx.send(AppEvent::UpdateDetailedTicker(data));
 }
-
 // --- MAIN LOOP ---
 
 #[tokio::main]
@@ -434,14 +527,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel();
     let tx_w = tx.clone(); let tx_t = tx.clone(); let tx_g = tx.clone(); let tx_n = tx.clone(); let tx_so = tx.clone();
     
-    tokio::spawn(async move { fetch_stock_data(tx).await; });
-    tokio::spawn(async move { fetch_weather_data(tx_w).await; });
-    tokio::spawn(async move { fetch_time(tx_t).await; });
-    tokio::spawn(async move { fetch_github_data(tx_g).await; });
-    tokio::spawn(async move { fetch_news_data(tx_n).await; });
-    tokio::spawn(async move { fetch_stock_overview_data(tx_so).await; });
+    tokio::spawn(async move { fetch_stock_data(tx_w).await; }); 
+    tokio::spawn(async move { fetch_weather_data(tx_t).await; });
+    tokio::spawn(async move { fetch_time(tx_g).await; });
+    tokio::spawn(async move { fetch_github_data(tx_n).await; });
+    tokio::spawn(async move { fetch_news_data(tx_so).await; });
+    
+    let tx_so_loop = tx.clone();
+    tokio::spawn(async move { fetch_stock_overview_data(tx_so_loop).await; });
 
-    let mut app = App::new();
+    let mut app = App::new(tx.clone());
     let res = run_app(&mut terminal, &mut app, rx);
 
     disable_raw_mode()?;
@@ -486,9 +581,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, rx: mpsc::Rece
         let mut should_quit = handle_action(app, action);
 
         while let Ok(pending_action) = action_rx.try_recv() {
-            if handle_action(app, pending_action) {
-                should_quit = true;
-            }
+            if handle_action(app, pending_action) { should_quit = true; }
         }
 
         if should_quit { return Ok(()); }
@@ -510,11 +603,19 @@ fn handle_action(app: &mut App, action: Action) -> bool {
             AppEvent::UpdateTime(s) => app.time_text = s,
             AppEvent::UpdateGithub(s) => app.github_text = s,
             AppEvent::UpdateNews(s) => app.news_text = s,
-            AppEvent::UpdateStockOverview(d) => app.stock_overview_data = d,
+            AppEvent::UpdateStockOverview(d) => {
+                if let Some(pos) = app.stock_overview_list.iter().position(|s| s.symbol == d.symbol) {
+                    app.stock_overview_list[pos] = d;
+                } else {
+                    app.stock_overview_list.push(d);
+                }
+            },
+            AppEvent::UpdateDetailedTicker(d) => {
+                app.detailed_ticker_data = d;
+            }
         },
         Action::Input(event) => match event {
             Event::Key(key) => {
-                // Global Escape
                 if key.code == KeyCode::Esc { 
                     app.focused_screen = FocusedScreen::Dashboard; 
                     app.input_mode = InputMode::Normal;
@@ -522,7 +623,6 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                     return false;
                 }
 
-                // TYPING MODE LOGIC
                 if app.input_mode != InputMode::Normal {
                     match key.code {
                         KeyCode::Enter => {
@@ -537,11 +637,8 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                                 InputMode::AddingScheduleTime => {
                                     if !app.input_buffer.trim().is_empty() {
                                         app.temp_schedule_time = app.input_buffer.clone();
-                                        app.input_buffer.clear();
                                         app.input_mode = InputMode::AddingScheduleActivity;
-                                    } else {
-                                        app.input_mode = InputMode::Normal;
-                                    }
+                                    } else { app.input_mode = InputMode::Normal; }
                                 }
                                 InputMode::AddingScheduleActivity => {
                                     if !app.input_buffer.trim().is_empty() {
@@ -550,6 +647,19 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                                             activity: app.input_buffer.clone() 
                                         });
                                         app.save_schedule();
+                                    }
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                InputMode::SearchingTicker => {
+                                    if !app.input_buffer.trim().is_empty() {
+                                        if let Some(tx) = &app.tx {
+                                            app.detailed_ticker_data.is_loading = true;
+                                            let symbol = app.input_buffer.trim().to_string();
+                                            let tx_clone = tx.clone();
+                                            tokio::spawn(async move {
+                                                fetch_detailed_ticker(symbol, tx_clone).await;
+                                            });
+                                        }
                                     }
                                     app.input_mode = InputMode::Normal;
                                 }
@@ -564,7 +674,6 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                     return false;
                 }
 
-                // NAVIGATION MODE LOGIC
                 if key.code == KeyCode::Char('q') { return true; }
                 
                 match app.focused_screen {
@@ -588,6 +697,12 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                             _ => {}
                         }
                     }
+                    FocusedScreen::StockOverview => {
+                        if key.code == KeyCode::Char('s') || key.code == KeyCode::Char('/') {
+                            app.input_mode = InputMode::SearchingTicker;
+                            app.input_buffer.clear();
+                        }
+                    }
                     FocusedScreen::Reminders => {
                         match key.code {
                             KeyCode::Up => { if app.reminder_index > 0 { app.reminder_index -= 1; } }
@@ -597,9 +712,7 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                             KeyCode::Char('d') | KeyCode::Backspace => {
                                 if !app.reminders.is_empty() {
                                     app.reminders.remove(app.reminder_index);
-                                    if app.reminder_index >= app.reminders.len() {
-                                        app.reminder_index = app.reminders.len().saturating_sub(1);
-                                    }
+                                    if app.reminder_index >= app.reminders.len() { app.reminder_index = app.reminders.len().saturating_sub(1); }
                                     app.save_reminders();
                                 }
                             }
@@ -614,9 +727,7 @@ fn handle_action(app: &mut App, action: Action) -> bool {
                             KeyCode::Char('d') | KeyCode::Backspace => {
                                 if !app.schedule.is_empty() {
                                     app.schedule.remove(app.schedule_index);
-                                    if app.schedule_index >= app.schedule.len() {
-                                        app.schedule_index = app.schedule.len().saturating_sub(1);
-                                    }
+                                    if app.schedule_index >= app.schedule.len() { app.schedule_index = app.schedule.len().saturating_sub(1); }
                                     app.save_schedule();
                                 }
                             }
@@ -646,32 +757,51 @@ fn standard_block<'a>(title: &'a str, is_selected: bool) -> Block<'a> {
     Block::default().title(title).borders(Borders::ALL).border_type(b_type).border_style(style)
 }
 
-// --- COMPONENT WIDGETS ---
-
 struct TimeWidget<'a> { text: &'a str }
 impl<'a> Widget for TimeWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.text)
-            .block(standard_block(" Time ", false))
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(area, buf);
-    }
+    fn render(self, area: Rect, buf: &mut Buffer) { Paragraph::new(self.text).block(standard_block(" Time ", false)).alignment(ratatui::layout::Alignment::Center).render(area, buf); }
 }
 
 struct StockWidget<'a> { text: &'a str, tick_count: u64, is_selected: bool }
 impl<'a> Widget for StockWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let inner_width = area.width.saturating_sub(2) as usize; 
-        let char_count = self.text.chars().count();
-        let display_ticker = if char_count > 0 && self.text.contains("   •   ") {
-            let offset = (self.tick_count as usize / 4) % char_count;
-            self.text.chars().cycle().skip(offset).take(inner_width).collect::<String>()
-        } else {
-            self.text.to_string()
-        };
-        Paragraph::new(display_ticker)
-            .block(standard_block(" Stocks ", self.is_selected))
-            .render(area, buf);
+        let block = standard_block(" Stocks ", self.is_selected);
+        let inner_area = block.inner(area);
+        block.render(area, buf);
+        let inner_width = inner_area.width as usize;
+        if inner_width == 0 { return; }
+        let gap = "     •     ";
+        let full_text = format!("{}{}", self.text, gap);
+        let styled_spans = self.parse_ticker_with_colors(&full_text);
+        let mut all_chars: Vec<(char, Style)> = Vec::new();
+        for span in styled_spans { for c in span.content.chars() { all_chars.push((c, span.style)); } }
+        let char_count = all_chars.len();
+        if char_count == 0 { return; }
+        let offset = if char_count > inner_width { (self.tick_count as usize / 2) % char_count } else { 0 };
+        let visible_chars = all_chars.iter().cycle().skip(offset).take(inner_width);
+        let mut final_spans = Vec::new();
+        for (c, style) in visible_chars { final_spans.push(Span::styled(c.to_string(), *style)); }
+        Paragraph::new(Line::from(final_spans)).render(inner_area, buf);
+    }
+}
+impl<'a> StockWidget<'a> {
+    fn parse_ticker_with_colors(&self, text: &str) -> Vec<Span<'static>> {
+        let mut spans = Vec::new(); let mut current_pos = 0;
+        while let Some(start_idx) = text[current_pos..].find('(') {
+            let absolute_start = current_pos + start_idx;
+            if let Some(end_idx) = text[absolute_start..].find(')') {
+                let absolute_end = absolute_start + end_idx;
+                spans.push(Span::raw(text[current_pos..absolute_start].to_string()));
+                let pct_str = &text[absolute_start..=absolute_end];
+                let numeric_part = pct_str.trim_matches(|c| c == '(' || c == ')' || c == '%' || c == '+');
+                let val: f64 = numeric_part.parse().unwrap_or(0.0);
+                let style = if val.abs() >= 0.5 { if val > 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) } } else { Style::default() };
+                spans.push(Span::styled(pct_str.to_string(), style));
+                current_pos = absolute_end + 1;
+            } else { break; }
+        }
+        if current_pos < text.len() { spans.push(Span::raw(text[current_pos..].to_string())); }
+        spans
     }
 }
 
@@ -749,7 +879,7 @@ impl<'a> Widget for WeatherWidget<'a> {
                     let row_seed = (y as u64).wrapping_mul(987654321);
                     if row_seed % 4 != 0 { continue; } 
                     
-                    let x_pos = inner_area.left() + (((self.tick_count / 4) + row_seed % 100) % inner_area.width as u64) as u16;
+                    let x_pos = inner_area.left() + (((self.tick_count / 2) + row_seed % 100) % inner_area.width as u64) as u16;
                     if let Some(cell) = buf.cell_mut((x_pos, y)) {
                         if cell.symbol() == " " {
                             cell.set_symbol("~").set_fg(Color::DarkGray);
@@ -776,43 +906,63 @@ impl<'a> Widget for WeatherWidget<'a> {
     }
 }
 
-struct StockOverviewWidget<'a> { data: &'a StockOverviewData, is_selected: bool }
+struct StockOverviewWidget<'a> { 
+    data_list: &'a [StockOverviewData], 
+    tick_count: u64,
+    is_selected: bool 
+}
+
 impl<'a> Widget for StockOverviewWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = standard_block(" (5d) Mini Chart ", self.is_selected);
+        let block = standard_block(" (5d) Mini Charts ", self.is_selected);
         let inner_area = block.inner(area);
         block.render(area, buf);
+        
+        if self.data_list.is_empty() {
+            Paragraph::new("Loading Stocks...").alignment(ratatui::layout::Alignment::Center).render(inner_area, buf);
+            return;
+        }
+
+        // --- LOOP LOGIC ---
+        let list_len = self.data_list.len();
+        if list_len == 0 { return; } // Guard against empty list
+
+        // Calculate index: (Total Ticks / Ticks per Slide) % Number of items
+        let display_index = (self.tick_count as usize / 250) % list_len;
+        let data = &self.data_list[display_index];
+        // ------------------
 
         if inner_area.height < 3 || inner_area.width < 5 { return; }
-
+        
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(0)])
             .split(inner_area);
 
-        let color = if self.data.change >= 0.0 { Color::Green } else { Color::Red };
-        let sign = if self.data.change >= 0.0 { "+" } else { "" };
+        let color = if data.change >= 0.0 { Color::Green } else { Color::Red };
+        let sign = if data.change >= 0.0 { "+" } else { "" };
         
+        // Show progress dots so you know there are more stocks
+        let pager: String = self.data_list
+            .iter()
+            .enumerate()
+            .map(|(i, _)| if i == display_index { "●" } else { "·" })
+            .collect();
+
         let header_text = format!(
-            "{} ({}) \n${:.2} | {}{:.2} ({}{:.2}%)",
-            self.data.symbol, self.data.company_name, 
-            self.data.price, sign, self.data.change, sign, self.data.change_percent
+            "{} ({}) \n${:.2} | {}{:.2} ({}{:.2}%) {}",
+            data.symbol, data.company_name,
+            data.price, sign, data.change, sign, data.change_percent,pager
         );
 
-        Paragraph::new(ratatui::text::Span::styled(header_text, Style::default().fg(color)))
-            .render(chunks[0], buf);
+        Paragraph::new(Span::styled(header_text, Style::default().fg(color))).render(chunks[0], buf);
 
-        if !self.data.chart_data.is_empty() {
-            let data_points: Vec<(f64, f64)> = self.data.chart_data
-                .iter()
-                .enumerate()
-                .map(|(i, &p)| (i as f64, p))
-                .collect();
-
-            let min_y = self.data.chart_data.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max_y = self.data.chart_data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if !data.chart_data.is_empty() {
+            let data_points: Vec<(f64, f64)> = data.chart_data.iter().enumerate().map(|(i, &p)| (i as f64, p)).collect();
+            let min_y = data.chart_data.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_y = data.chart_data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let max_x = (data_points.len().saturating_sub(1)) as f64;
-
+            
             let dataset = Dataset::default()
                 .marker(symbols::Marker::Braille)
                 .style(Style::default().fg(color))
@@ -823,72 +973,18 @@ impl<'a> Widget for StockOverviewWidget<'a> {
                 .x_axis(ratatui::widgets::Axis::default().bounds([0.0, max_x]))
                 .y_axis(ratatui::widgets::Axis::default().bounds([min_y, max_y]))
                 .render(chunks[1], buf);
-        } else {
-            Paragraph::new("Loading chart data...")
-                .alignment(ratatui::layout::Alignment::Center)
-                .render(chunks[1], buf);
         }
     }
 }
 
 struct GithubWidget<'a> { text: &'a str, is_selected: bool }
-impl<'a> Widget for GithubWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.text)
-            .block(standard_block(" GitHub Updates ", self.is_selected))
-            .render(area, buf);
-    }
-}
-
+impl<'a> Widget for GithubWidget<'a> { fn render(self, area: Rect, buf: &mut Buffer) { Paragraph::new(self.text).block(standard_block(" GitHub Updates ", self.is_selected)).render(area, buf); } }
 struct NewsWidget<'a> { text: &'a str, is_selected: bool }
-impl<'a> Widget for NewsWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.text)
-            .block(standard_block(" Top News ", self.is_selected))
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .render(area, buf);
-    }
-}
-
+impl<'a> Widget for NewsWidget<'a> { fn render(self, area: Rect, buf: &mut Buffer) { Paragraph::new(self.text).block(standard_block(" Top News ", self.is_selected)).wrap(Wrap { trim: true }).render(area, buf); } }
 struct ScheduleWidget<'a> { schedule: &'a [ScheduleItem], is_selected: bool }
-impl<'a> Widget for ScheduleWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let items: Vec<ListItem> = self.schedule.iter().map(|i| {
-            ListItem::new(format!(" {} | {}", i.time, i.activity))
-        }).collect();
-        List::new(items)
-            .block(standard_block(" Schedule ", self.is_selected))
-            .render(area, buf);
-    }
-}
-
+impl<'a> Widget for ScheduleWidget<'a> { fn render(self, area: Rect, buf: &mut Buffer) { let items: Vec<ListItem> = self.schedule.iter().map(|i| ListItem::new(format!(" {} | {}", i.time, i.activity))).collect(); List::new(items).block(standard_block(" Schedule ", self.is_selected)).render(area, buf); } }
 struct RemindersWidget<'a> { reminders: &'a [ReminderItem], active_idx: usize, is_selected: bool }
-impl<'a> Widget for RemindersWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let items: Vec<ListItem> = self.reminders.iter().enumerate().map(|(i, r)| {
-            let sym = if r.is_done { "[x]" } else { "[ ]" };
-            let style = if i == self.active_idx && self.is_selected { 
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) 
-            } else { 
-                Style::default() 
-            };
-            ListItem::new(format!(" {} {}", sym, r.task)).style(style)
-        }).collect();
-        List::new(items)
-            .block(standard_block(" Reminders (Space) ", self.is_selected))
-            .render(area, buf);
-    }
-}
-
-struct FocusedViewWidget<'a> { title: &'a str }
-impl<'a> Widget for FocusedViewWidget<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("\n\nDetailed view goes here.\n\nPress 'Esc' or Click anywhere to return.")
-            .block(standard_block(self.title, true))
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(area, buf);
-    }
-}
+impl<'a> Widget for RemindersWidget<'a> { fn render(self, area: Rect, buf: &mut Buffer) { let items: Vec<ListItem> = self.reminders.iter().enumerate().map(|(i, r)| { let sym = if r.is_done { "[x]" } else { "[ ]" }; let style = if i == self.active_idx && self.is_selected { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() }; ListItem::new(format!(" {} {}", sym, r.task)).style(style) }).collect(); List::new(items).block(standard_block(" Reminders (Space) ", self.is_selected)).render(area, buf); } }
 
 struct FocusedRemindersWidget<'a> { app: &'a App }
 impl<'a> Widget for FocusedRemindersWidget<'a> {
@@ -896,24 +992,10 @@ impl<'a> Widget for FocusedRemindersWidget<'a> {
         let block = standard_block(" Interactive Reminders Manager ", true);
         let inner = block.inner(area);
         block.render(area, buf);
-
-        let layout = Layout::default().direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
-            .split(inner);
-
-        // List View
-        let items: Vec<ListItem> = self.app.reminders.iter().enumerate().map(|(i, r)| {
-            let sym = if r.is_done { "[x]" } else { "[ ]" };
-            let style = if i == self.app.reminder_index { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() };
-            ListItem::new(format!(" {} {}", sym, r.task)).style(style)
-        }).collect();
+        let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(0), Constraint::Length(3)]).split(inner);
+        let items: Vec<ListItem> = self.app.reminders.iter().enumerate().map(|(i, r)| { let sym = if r.is_done { "[x]" } else { "[ ]" }; let style = if i == self.app.reminder_index { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() }; ListItem::new(format!(" {} {}", sym, r.task)).style(style) }).collect();
         List::new(items).render(layout[0], buf);
-
-        // Input / Instruction View
-        let bottom_text = match self.app.input_mode {
-            InputMode::AddingReminder => format!("New Reminder: {}█", self.app.input_buffer),
-            _ => "Keys: [a] Add  |  [d]/[Backspace] Delete  |  [Space]/[Enter] Toggle  |  [Esc] Exit".to_string(),
-        };
+        let bottom_text = match self.app.input_mode { InputMode::AddingReminder => format!("New Reminder: {}█", self.app.input_buffer), _ => "Keys: [a] Add  |  [d]/[Backspace] Delete  |  [Space]/[Enter] Toggle  |  [Esc] Exit".to_string(), };
         Paragraph::new(bottom_text).block(Block::default().borders(Borders::TOP)).render(layout[1], buf);
     }
 }
@@ -924,26 +1006,168 @@ impl<'a> Widget for FocusedScheduleWidget<'a> {
         let block = standard_block(" Interactive Calendar Manager ", true);
         let inner = block.inner(area);
         block.render(area, buf);
-
-        let layout = Layout::default().direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
-            .split(inner);
-
-        // List View
-        let items: Vec<ListItem> = self.app.schedule.iter().enumerate().map(|(i, s)| {
-            let style = if i == self.app.schedule_index { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() };
-            ListItem::new(format!(" [{}] {}", s.time, s.activity)).style(style)
-        }).collect();
+        let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(0), Constraint::Length(3)]).split(inner);
+        let items: Vec<ListItem> = self.app.schedule.iter().enumerate().map(|(i, s)| { let style = if i == self.app.schedule_index { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() }; ListItem::new(format!(" [{}] {}", s.time, s.activity)).style(style) }).collect();
         List::new(items).render(layout[0], buf);
-
-        // Input / Instruction View
-        let bottom_text = match self.app.input_mode {
-            InputMode::AddingScheduleTime => format!("Enter Time (e.g., 14:30): {}█", self.app.input_buffer),
-            InputMode::AddingScheduleActivity => format!("Time: {} | Enter Activity: {}█", self.app.temp_schedule_time, self.app.input_buffer),
-            _ => "Keys: [a] Add  |  [d]/[Backspace] Delete  |  [Esc] Exit".to_string(),
-        };
+        let bottom_text = match self.app.input_mode { InputMode::AddingScheduleTime => format!("Enter Time (e.g., 14:30): {}█", self.app.input_buffer), InputMode::AddingScheduleActivity => format!("Time: {} | Enter Activity: {}█", self.app.temp_schedule_time, self.app.input_buffer), _ => "Keys: [a] Add  |  [d]/[Backspace] Delete  |  [Esc] Exit".to_string(), };
         Paragraph::new(bottom_text).block(Block::default().borders(Borders::TOP)).render(layout[1], buf);
     }
+}struct FocusedStockOverviewWidget<'a> { app: &'a App }
+
+impl<'a> Widget for FocusedStockOverviewWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = standard_block(" Advanced Ticker Terminal (Yahoo Finance Data) ", true);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(inner);
+
+        // 1. Search Bar
+        let search_text = match self.app.input_mode {
+            InputMode::SearchingTicker => format!(" Search Ticker: {}█", self.app.input_buffer),
+            _ => " Keys: [s] or [/] to Search  |  [Esc] to Dashboard".to_string(),
+        };
+        Paragraph::new(search_text)
+            .block(Block::default().borders(Borders::BOTTOM))
+            .style(Style::default().fg(Color::Yellow))
+            .render(layout[0], buf);
+
+        let data = &self.app.detailed_ticker_data;
+        
+        if data.is_loading {
+            Paragraph::new("\n\nFetching intelligence from Yahoo Finance...\nPlease Wait.")
+                .alignment(ratatui::layout::Alignment::Center)
+                .render(layout[1], buf);
+            return;
+        }
+
+        if data.symbol.is_empty() {
+            Paragraph::new("\n\nPress 's' to search for a ticker (e.g., AAPL, TSLA, MSFT).")
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray))
+                .render(layout[1], buf);
+            return;
+        }
+
+        let data_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(layout[1]);
+
+        let top_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(data_layout[0]);
+
+        // --- LEFT PANE: Profile ---
+        let overview_text = vec![
+            Line::from(vec![
+                Span::styled(format!(" {} ", data.symbol), Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                Span::raw(format!("  {} • {}", data.sector, data.industry)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Company Summary:", Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED))),
+            Line::from(data.description.clone()),
+        ];
+        
+        Paragraph::new(overview_text)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().padding(ratatui::widgets::Padding::new(1, 2, 1, 1)))
+            .render(top_layout[0], buf);
+
+        // --- RIGHT PANE: Financials, Peers, & News ---
+        let right_col_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6), // Financials
+                Constraint::Length(7), // Peers
+                Constraint::Min(0),    // News
+            ])
+            .split(top_layout[1]);
+
+        // Financials
+        let rating_color = match data.analyst_rating.as_str() {
+            "STRONG BUY" | "BUY" => Color::LightGreen,
+            "SELL" | "STRONG SELL" => Color::LightRed,
+            _ => Color::Yellow,
+        };
+        let financial_lines = vec![
+            ListItem::new(Line::from(vec![Span::raw("Price:    "), Span::styled(format!("${:.2}", data.price), Style::default().fg(Color::White))])),
+            ListItem::new(Line::from(vec![Span::raw("Mkt Cap:  "), Span::styled(data.market_cap.clone(), Style::default().fg(Color::White))])),
+            ListItem::new(Line::from(vec![Span::raw("P/E:      "), Span::styled(data.pe_ratio.clone(), Style::default().fg(Color::White))])),
+            ListItem::new(Line::from(vec![Span::raw("Rating:   "), Span::styled(data.analyst_rating.clone(), Style::default().fg(rating_color).add_modifier(Modifier::BOLD))])),
+        ];
+        List::new(financial_lines)
+            .block(Block::default().title(" Financials ").borders(Borders::LEFT).padding(ratatui::widgets::Padding::new(2, 1, 0, 0)))
+            .render(right_col_split[0], buf);
+
+        // Peers
+        let related_items: Vec<ListItem> = data.related_tickers.iter().map(|t| {
+            ListItem::new(Line::from(vec![Span::styled(" ➜ ", Style::default().fg(Color::Yellow)), Span::raw(t.clone())]))
+        }).collect();
+        List::new(related_items)
+            .block(Block::default().title(" Market Peers ").borders(Borders::LEFT).padding(ratatui::widgets::Padding::new(2, 1, 0, 0)))
+            .render(right_col_split[1], buf);
+
+        // --- Latest News (Using Paragraph for wrapping support) ---
+        if data.ticker_news.is_empty() {
+            Paragraph::new("No recent news found for this ticker.")
+                .block(Block::default().title(" Latest News ").borders(Borders::LEFT).padding(ratatui::widgets::Padding::new(2, 1, 0, 0)))
+                .style(Style::default().fg(Color::DarkGray))
+                .render(right_col_split[2], buf);
+        } else {
+            let mut news_lines = Vec::new();
+            for headline in &data.ticker_news {
+                news_lines.push(Line::from(vec![
+                    Span::styled(" • ", Style::default().fg(Color::Cyan)),
+                    Span::raw(headline.clone()),
+                ]));
+                news_lines.push(Line::from(""));
+            }
+            Paragraph::new(news_lines)
+                .block(Block::default().title(" Latest News ").borders(Borders::LEFT).padding(ratatui::widgets::Padding::new(2, 1, 0, 0)))
+                .wrap(Wrap { trim: true })
+                .render(right_col_split[2], buf);
+        }
+        // --- BOTTOM PANE: Chart ---
+        let chart_color = if data.change >= 0.0 { Color::Green } else { Color::Red };
+        let sign = if data.change >= 0.0 { "+" } else { "" };
+        let chart_title = format!(" 5-Day Trend: ${:.2} ({}{:.2}%) ", data.price, sign, data.change_percent);
+
+        if !data.chart_data.is_empty() {
+            let data_points: Vec<(f64, f64)> = data.chart_data.iter().enumerate().map(|(i, &p)| (i as f64, p)).collect();
+            let min_y = data.chart_data.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_y = data.chart_data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let max_x = (data_points.len().saturating_sub(1)) as f64;
+
+            let dataset = Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(chart_color))
+                .graph_type(GraphType::Line)
+                .data(&data_points);
+
+            Chart::new(vec![dataset])
+                .block(Block::default().title(chart_title).borders(Borders::TOP).padding(ratatui::widgets::Padding::new(1, 1, 1, 0)))
+                .x_axis(ratatui::widgets::Axis::default().bounds([0.0, max_x]))
+                .y_axis(ratatui::widgets::Axis::default().bounds([min_y, max_y]).labels(vec![
+                    Span::raw(format!("{:.2}", min_y)),
+                    Span::raw(format!("{:.2}", max_y)),
+                ]))
+                .render(data_layout[1], buf);
+        } else {
+            Paragraph::new("Loading market data...")
+                .block(Block::default().title(chart_title).borders(Borders::TOP))
+                .alignment(ratatui::layout::Alignment::Center)
+                .render(data_layout[1], buf);
+        }
+    }
+}
+struct FocusedViewWidget<'a> { title: &'a str }
+impl<'a> Widget for FocusedViewWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) { Paragraph::new("\n\nDetailed view goes here.\n\nPress 'Esc' or Click anywhere to return.").block(standard_block(self.title, true)).alignment(ratatui::layout::Alignment::Center).render(area, buf); }
 }
 
 struct MatrixEdgeOverlay { tick: u64 }
@@ -964,11 +1188,7 @@ impl Widget for MatrixEdgeOverlay {
                         let chars = ['0','1','2','3','4','5','6','7','8','9','A','B','C','Z','X','Y','W','*','+','=','-',':','.','"','$','%','&'];
                         let c = chars[local_rng.random_range(0..chars.len())];
                         cell.set_symbol(&c.to_string());
-                        
-                        if dist_to_head == 0 { cell.set_fg(Color::White); } 
-                        else if dist_to_head < 3 { cell.set_fg(Color::LightGreen); } 
-                        else if dist_to_head > 11 { cell.set_fg(Color::DarkGray); } 
-                        else { cell.set_fg(Color::Green); }
+                        if dist_to_head == 0 { cell.set_fg(Color::White); } else if dist_to_head < 3 { cell.set_fg(Color::LightGreen); } else if dist_to_head > 11 { cell.set_fg(Color::DarkGray); } else { cell.set_fg(Color::Green); }
                     }
                 }
             }
@@ -990,6 +1210,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         match app.focused_screen {
             FocusedScreen::Reminders => f.render_widget(FocusedRemindersWidget { app }, inner_area),
             FocusedScreen::Schedule => f.render_widget(FocusedScheduleWidget { app }, inner_area),
+            FocusedScreen::StockOverview => f.render_widget(FocusedStockOverviewWidget { app }, inner_area), 
             _ => {
                 let title = format!(" Focused: {:?} ", app.focused_screen);
                 f.render_widget(FocusedViewWidget { title: &title }, inner_area);
@@ -1016,11 +1237,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let left_col = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(30), 
-            Constraint::Percentage(40), 
-            Constraint::Percentage(30), 
-        ])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(40), Constraint::Percentage(30)])
         .split(body[0]);
 
     let right_col = Layout::default()
@@ -1036,16 +1253,16 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(TimeWidget { text: &app.time_text }, app.time_rect);
     f.render_widget(StockWidget { text: &app.stock_text, tick_count: app.tick_count, is_selected: sel == SelectableWidget::Stock }, app.stock_rect);
+    f.render_widget(WeatherWidget { text: &app.weather_text, is_selected: sel == SelectableWidget::Weather, tick_count: app.tick_count, condition: app.weather_condition }, app.weather_rect);
     
-    f.render_widget(WeatherWidget { 
-        text: &app.weather_text, 
-        is_selected: sel == SelectableWidget::Weather,
+    // FIX 2: Passed `data_list: &app.stock_overview_list` and `tick_count` instead of a non-existent `data` field
+    f.render_widget(StockOverviewWidget { 
+        data_list: &app.stock_overview_list, 
         tick_count: app.tick_count,
-        condition: app.weather_condition
-    }, app.weather_rect);
-    f.render_widget(StockOverviewWidget { data: &app.stock_overview_data, is_selected: sel == SelectableWidget::StockOverview }, app.stock_overview_rect);
-    f.render_widget(GithubWidget { text: &app.github_text, is_selected: sel == SelectableWidget::Github }, app.github_rect);
+        is_selected: sel == SelectableWidget::StockOverview 
+    }, app.stock_overview_rect);
     
+    f.render_widget(GithubWidget { text: &app.github_text, is_selected: sel == SelectableWidget::Github }, app.github_rect);
     f.render_widget(NewsWidget { text: &app.news_text, is_selected: sel == SelectableWidget::News }, app.news_rect);
     f.render_widget(ScheduleWidget { schedule: &app.schedule, is_selected: sel == SelectableWidget::Schedule }, app.schedule_rect);
     f.render_widget(RemindersWidget { reminders: &app.reminders, active_idx: app.reminder_index, is_selected: sel == SelectableWidget::Reminders }, app.reminders_rect);
