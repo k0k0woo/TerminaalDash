@@ -13,9 +13,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use rand::{Rng, RngExt};
-use chrono::{Datelike, Utc, Local, Duration as ChronoDuration};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{io, time::Duration, sync::mpsc};
 
 // --- DATA STRUCTURES ---
@@ -79,9 +78,20 @@ enum SelectableWidget {
     Stock, Weather, StockOverview, Github, News, Schedule, Reminders,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum InputMode {
+    Normal,
+    AddingReminder,
+    AddingScheduleTime,
+    AddingScheduleActivity,
+}
+
 struct App {
     focused_screen: FocusedScreen,
     selected_widget: SelectableWidget,
+    input_mode: InputMode,
+    input_buffer: String,
+    temp_schedule_time: String,
     tick_count: u64,
     stock_text: String, 
     weather_text: String,
@@ -91,6 +101,7 @@ struct App {
     news_text: String,
     stock_overview_data: StockOverviewData,
     schedule: Vec<ScheduleItem>,
+    schedule_index: usize,
     reminders: Vec<ReminderItem>,
     reminder_index: usize,
     time_rect: Rect, stock_rect: Rect, weather_rect: Rect, stock_overview_rect: Rect, github_rect: Rect,
@@ -99,7 +110,9 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let schedule = serde_json::from_str(&std::fs::read_to_string("schedule.json").unwrap_or_else(|_| "[]".to_string())).unwrap_or_default();
+        let mut schedule: Vec<ScheduleItem> = serde_json::from_str(&std::fs::read_to_string("schedule.json").unwrap_or_else(|_| "[]".to_string())).unwrap_or_default();
+        schedule.sort_by(|a, b| a.time.cmp(&b.time)); // Auto-sort on load
+        
         let reminders = serde_json::from_str(&std::fs::read_to_string("reminders.json").unwrap_or_else(|_| "[]".to_string())).unwrap_or_default();
         
         let mut default_overview = StockOverviewData::default();
@@ -108,6 +121,9 @@ impl App {
         Self {
             focused_screen: FocusedScreen::Dashboard,
             selected_widget: SelectableWidget::Stock,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            temp_schedule_time: String::new(),
             tick_count: 0,
             stock_text: "Initializing Smart Fetcher...".to_string(), 
             weather_text: "\nLoading Weather...".to_string(),
@@ -117,6 +133,7 @@ impl App {
             news_text: "\nLoading RSS Feeds...".to_string(),
             stock_overview_data: default_overview,
             schedule,
+            schedule_index: 0,
             reminders,
             reminder_index: 0,
             time_rect: Rect::default(), stock_rect: Rect::default(), weather_rect: Rect::default(),
@@ -131,6 +148,13 @@ impl App {
         }
     }
 
+    fn save_schedule(&mut self) {
+        self.schedule.sort_by(|a, b| a.time.cmp(&b.time)); // Keep chronological
+        if let Ok(json) = serde_json::to_string_pretty(&self.schedule) {
+            let _ = std::fs::write("schedule.json", json);
+        }
+    }
+
     fn toggle_reminder(&mut self) {
         if !self.reminders.is_empty() {
             self.reminders[self.reminder_index].is_done = !self.reminders[self.reminder_index].is_done;
@@ -141,6 +165,7 @@ impl App {
     fn handle_click(&mut self, x: u16, y: u16) {
         if self.focused_screen != FocusedScreen::Dashboard {
             self.focused_screen = FocusedScreen::Dashboard;
+            self.input_mode = InputMode::Normal;
             return;
         }
         let in_rect = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
@@ -218,33 +243,20 @@ async fn fetch_weather_data(tx: mpsc::Sender<AppEvent>) {
                         let desc = weather_obj.get("main").and_then(|v| v.as_str()).unwrap_or("Unknown");
                         let temp = json.get("main").and_then(|m| m.get("temp")).and_then(|v| v.as_f64()).unwrap_or(0.0);
                         
-                        // Parse weather condition for our animations
                         let desc_lower = desc.to_lowercase();
-                        
-                        let condition = if desc_lower.contains("storm") || desc_lower.contains("thunderstorm") {
-                            WeatherCondition::Storm
-                        } else if desc_lower.contains("snow") {
-                            WeatherCondition::Snow
-                        } else if desc_lower.contains("rain") || desc_lower.contains("drizzle") {
-                            WeatherCondition::Rain
-                        } else if desc_lower.contains("cloud") {
-                            WeatherCondition::Clouds
-                        } else {
-                            WeatherCondition::Clear
-                        };
+                        let condition = if desc_lower.contains("storm") || desc_lower.contains("thunderstorm") { WeatherCondition::Storm } 
+                        else if desc_lower.contains("snow") { WeatherCondition::Snow } 
+                        else if desc_lower.contains("rain") || desc_lower.contains("drizzle") { WeatherCondition::Rain } 
+                        else if desc_lower.contains("cloud") { WeatherCondition::Clouds } 
+                        else { WeatherCondition::Clear };
 
                         let emoji = match condition {
-                            WeatherCondition::Storm => "🌩️",
-                            WeatherCondition::Snow => "❄️",
-                            WeatherCondition::Rain => "🌧️",
-                            WeatherCondition::Clouds => "☁️",
-                            WeatherCondition::Clear => "☀️",
-                            WeatherCondition::Unknown => "🌡️",
+                            WeatherCondition::Storm => "🌩️", WeatherCondition::Snow => "❄️",
+                            WeatherCondition::Rain => "🌧️", WeatherCondition::Clouds => "☁️",
+                            WeatherCondition::Clear => "☀️", WeatherCondition::Unknown => "🌡️",
                         };
 
                         let formatted = format!("{}\n{} {:.1}°C\n{}", json.get("name").and_then(|v| v.as_str()).unwrap_or(&city), emoji, temp, desc);
-                        
-                        // Send both the text and the condition
                         let _ = tx.send(AppEvent::UpdateWeather(formatted, condition));
                     }
                 }
@@ -255,16 +267,31 @@ async fn fetch_weather_data(tx: mpsc::Sender<AppEvent>) {
 }
 
 async fn fetch_news_data(tx: mpsc::Sender<AppEvent>) {
-    let feeds = vec!["https://www.investing.com/rss/news.rss", "https://news.ycombinator.com/rss", "http://feeds.bbci.co.uk/news/rss.xml", "https://finance.yahoo.com/news/rssindex"];
-    let client = reqwest::Client::new();
+    let feeds = vec![
+        "https://www.investing.com/rss/news.rss",
+        "https://news.ycombinator.com/rss",
+        "https://feeds.bbci.co.uk/news/rss.xml"
+    ];
+    
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .unwrap_or_default();
+
     loop {
         let mut headlines = Vec::new();
         for url in &feeds {
             if let Ok(res) = client.get(*url).send().await {
                 if let Ok(bytes) = res.bytes().await {
                     if let Ok(channel) = rss::Channel::read_from(&bytes[..]) {
+                        // 1. Get the channel name (e.g., "BBC News - World")
+                        let channel_name = channel.title().split('-').next().unwrap_or("News").trim();
+
                         for item in channel.items().iter().take(2) {
-                            if let Some(title) = item.title() { headlines.push(format!("• {}", title)); }
+                            if let Some(title) = item.title() { 
+                                // 2. Format as "Source: Title"
+                                headlines.push(format!("• {}: {}", channel_name, title)); 
+                            }
                         }
                     }
                 }
@@ -274,15 +301,14 @@ async fn fetch_news_data(tx: mpsc::Sender<AppEvent>) {
         tokio::time::sleep(Duration::from_secs(1200)).await;
     }
 }
-
 async fn fetch_github_data(tx: mpsc::Sender<AppEvent>) {
     dotenvy::dotenv().ok();
     let username = std::env::var("GITHUB_USERNAME").unwrap_or_else(|_| "torvalds".to_string());
     let token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().user_agent("Ratatui-Dashboard").build().unwrap_or_default();
     let url = format!("https://api.github.com/users/{}/events", username);
     loop {
-        let mut req = client.get(&url).header("User-Agent", "Ratatui-Dashboard");
+        let mut req = client.get(&url);
         if !token.is_empty() { req = req.header("Authorization", format!("Bearer {}", token)); }
         if let Ok(res) = req.send().await {
             if let Ok(json) = res.json::<serde_json::Value>().await {
@@ -301,59 +327,44 @@ async fn fetch_github_data(tx: mpsc::Sender<AppEvent>) {
 }
 
 async fn fetch_stock_data(tx: mpsc::Sender<AppEvent>) {
-    // Mimic a standard web browser to bypass bot protection
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()
         .unwrap_or_default();
 
     loop {
         let file_contents = tokio::fs::read_to_string("stocks.txt").await.unwrap_or_else(|_| "AAPL".to_string());
         let symbols: Vec<&str> = file_contents.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        
         let mut ticker_parts = Vec::new();
         
         for symbol in &symbols {
-            // Use the v8 chart endpoint to pull just 1 day of data
             let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d", symbol);
-            
             if let Ok(res) = client.get(&url).send().await {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
-                    // Extract the live price from the meta block just like the overview widget
                     if let Some(meta) = json["chart"]["result"][0]["meta"].as_object() {
                         let price = meta.get("regularMarketPrice").and_then(|p| p.as_f64()).unwrap_or(0.0);
                         let prev_close = meta.get("chartPreviousClose").and_then(|p| p.as_f64()).unwrap_or(price);
                         
-                        // Calculate change so we can add a nice +/- percentage to the tape
-                        let change_percent = if prev_close > 0.0 {
-                            ((price - prev_close) / prev_close) * 100.0
-                        } else {
-                            0.0
-                        };
-                        
+                        let change_percent = if prev_close > 0.0 { ((price - prev_close) / prev_close) * 100.0 } else { 0.0 };
                         let sign = if change_percent >= 0.0 { "+" } else { "" };
                         
-                        // Formats as: AAPL $260.58 (+1.54%)
                         ticker_parts.push(format!("{} ${:.2} ({}{:.2}%)", symbol, price, sign, change_percent));
                     }
                 }
             }
-            // Sleep briefly to avoid getting rate-limited by Yahoo
             tokio::time::sleep(Duration::from_millis(2000)).await;
         }
         
         if !ticker_parts.is_empty() {
             let _ = tx.send(AppEvent::UpdateStock(format!("   •   {}   •   ", ticker_parts.join("   •   "))));
         }
-        
-        // Wait 5 minutes before refreshing the entire tape
         tokio::time::sleep(Duration::from_secs(300)).await;
     }
 }
+
 async fn fetch_stock_overview_data(tx: mpsc::Sender<AppEvent>) {
-    // Mimic a standard web browser to keep Yahoo happy
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()
         .unwrap_or_default();
 
@@ -373,25 +384,19 @@ async fn fetch_stock_overview_data(tx: mpsc::Sender<AppEvent>) {
                 ..Default::default()
             };
 
-            // Rely entirely on the v8 chart endpoint, which we know works
             let chart_url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=15m&range=5d", symbol);
             
             if let Ok(res) = client.get(&chart_url).send().await {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
                     
-                    // 1. Extract the Chart Data
                     if let Some(close_prices) = json["chart"]["result"][0]["indicators"]["quote"][0]["close"].as_array() {
-                        let mut recent_prices: Vec<f64> = close_prices.iter()
-                            .filter_map(|v| v.as_f64())
-                            .collect();
-                        
+                        let mut recent_prices: Vec<f64> = close_prices.iter().filter_map(|v| v.as_f64()).collect();
                         if recent_prices.len() > 50 {
                             recent_prices = recent_prices[recent_prices.len() - 50..].to_vec();
                         }
                         overview.chart_data = recent_prices;
                     }
 
-                    // 2. Extract the Stats from the chart's "meta" block
                     if let Some(meta) = json["chart"]["result"][0]["meta"].as_object() {
                         if let Some(name) = meta.get("shortName").and_then(|n| n.as_str()) {
                             overview.company_name = name.to_string();
@@ -405,13 +410,12 @@ async fn fetch_stock_overview_data(tx: mpsc::Sender<AppEvent>) {
                         if prev_close > 0.0 {
                             overview.change_percent = (overview.change / prev_close) * 100.0;
                         }
-                        overview.market_cap = "N/A".to_string(); // We won't use this anymore
+                        overview.market_cap = "N/A".to_string(); 
                     }
                 }
             }
 
             let _ = tx.send(AppEvent::UpdateStockOverview(overview));
-            
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
@@ -435,7 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move { fetch_time(tx_t).await; });
     tokio::spawn(async move { fetch_github_data(tx_g).await; });
     tokio::spawn(async move { fetch_news_data(tx_n).await; });
-    tokio::spawn(async move { fetch_stock_overview_data(tx_so).await; }); // Spawn new fetcher
+    tokio::spawn(async move { fetch_stock_overview_data(tx_so).await; });
 
     let mut app = App::new();
     let res = run_app(&mut terminal, &mut app, rx);
@@ -500,8 +504,8 @@ fn handle_action(app: &mut App, action: Action) -> bool {
         Action::Backend(event) => match event {
             AppEvent::UpdateStock(s) => app.stock_text = s,
             AppEvent::UpdateWeather(s, c) => {
-            app.weather_text = s;
-            app.weather_condition = c;
+                app.weather_text = s;
+                app.weather_condition = c;
             },
             AppEvent::UpdateTime(s) => app.time_text = s,
             AppEvent::UpdateGithub(s) => app.github_text = s,
@@ -510,27 +514,116 @@ fn handle_action(app: &mut App, action: Action) -> bool {
         },
         Action::Input(event) => match event {
             Event::Key(key) => {
-                if key.code == KeyCode::Char('q') { return true; }
-                if key.code == KeyCode::Esc { app.focused_screen = FocusedScreen::Dashboard; }
-                if key.code == KeyCode::Char(' ') && app.selected_widget == SelectableWidget::Reminders { 
-                    app.toggle_reminder(); 
+                // Global Escape
+                if key.code == KeyCode::Esc { 
+                    app.focused_screen = FocusedScreen::Dashboard; 
+                    app.input_mode = InputMode::Normal;
+                    app.input_buffer.clear();
+                    return false;
                 }
-                if app.focused_screen == FocusedScreen::Dashboard {
+
+                // TYPING MODE LOGIC
+                if app.input_mode != InputMode::Normal {
                     match key.code {
-                        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => app.move_selection(key.code),
                         KeyCode::Enter => {
-                            app.focused_screen = match app.selected_widget {
-                                SelectableWidget::Stock => FocusedScreen::Stock,
-                                SelectableWidget::Weather => FocusedScreen::Weather,
-                                SelectableWidget::StockOverview => FocusedScreen::StockOverview,
-                                SelectableWidget::Github => FocusedScreen::Github,
-                                SelectableWidget::News => FocusedScreen::News,
-                                SelectableWidget::Schedule => FocusedScreen::Schedule,
-                                SelectableWidget::Reminders => FocusedScreen::Reminders,
-                            };
+                            match app.input_mode {
+                                InputMode::AddingReminder => {
+                                    if !app.input_buffer.trim().is_empty() {
+                                        app.reminders.push(ReminderItem { task: app.input_buffer.clone(), is_done: false });
+                                        app.save_reminders();
+                                    }
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                InputMode::AddingScheduleTime => {
+                                    if !app.input_buffer.trim().is_empty() {
+                                        app.temp_schedule_time = app.input_buffer.clone();
+                                        app.input_buffer.clear();
+                                        app.input_mode = InputMode::AddingScheduleActivity;
+                                    } else {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                }
+                                InputMode::AddingScheduleActivity => {
+                                    if !app.input_buffer.trim().is_empty() {
+                                        app.schedule.push(ScheduleItem { 
+                                            time: app.temp_schedule_time.clone(), 
+                                            activity: app.input_buffer.clone() 
+                                        });
+                                        app.save_schedule();
+                                    }
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                _ => {}
+                            }
+                            app.input_buffer.clear();
                         }
+                        KeyCode::Backspace => { app.input_buffer.pop(); }
+                        KeyCode::Char(c) => { app.input_buffer.push(c); }
                         _ => {}
                     }
+                    return false;
+                }
+
+                // NAVIGATION MODE LOGIC
+                if key.code == KeyCode::Char('q') { return true; }
+                
+                match app.focused_screen {
+                    FocusedScreen::Dashboard => {
+                        if key.code == KeyCode::Char(' ') && app.selected_widget == SelectableWidget::Reminders { 
+                            app.toggle_reminder(); 
+                        }
+                        match key.code {
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => app.move_selection(key.code),
+                            KeyCode::Enter => {
+                                app.focused_screen = match app.selected_widget {
+                                    SelectableWidget::Stock => FocusedScreen::Stock,
+                                    SelectableWidget::Weather => FocusedScreen::Weather,
+                                    SelectableWidget::StockOverview => FocusedScreen::StockOverview,
+                                    SelectableWidget::Github => FocusedScreen::Github,
+                                    SelectableWidget::News => FocusedScreen::News,
+                                    SelectableWidget::Schedule => FocusedScreen::Schedule,
+                                    SelectableWidget::Reminders => FocusedScreen::Reminders,
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                    FocusedScreen::Reminders => {
+                        match key.code {
+                            KeyCode::Up => { if app.reminder_index > 0 { app.reminder_index -= 1; } }
+                            KeyCode::Down => { if app.reminder_index < app.reminders.len().saturating_sub(1) { app.reminder_index += 1; } }
+                            KeyCode::Char(' ') | KeyCode::Enter => { app.toggle_reminder(); }
+                            KeyCode::Char('a') => { app.input_mode = InputMode::AddingReminder; app.input_buffer.clear(); }
+                            KeyCode::Char('d') | KeyCode::Backspace => {
+                                if !app.reminders.is_empty() {
+                                    app.reminders.remove(app.reminder_index);
+                                    if app.reminder_index >= app.reminders.len() {
+                                        app.reminder_index = app.reminders.len().saturating_sub(1);
+                                    }
+                                    app.save_reminders();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    FocusedScreen::Schedule => {
+                        match key.code {
+                            KeyCode::Up => { if app.schedule_index > 0 { app.schedule_index -= 1; } }
+                            KeyCode::Down => { if app.schedule_index < app.schedule.len().saturating_sub(1) { app.schedule_index += 1; } }
+                            KeyCode::Char('a') => { app.input_mode = InputMode::AddingScheduleTime; app.input_buffer.clear(); }
+                            KeyCode::Char('d') | KeyCode::Backspace => {
+                                if !app.schedule.is_empty() {
+                                    app.schedule.remove(app.schedule_index);
+                                    if app.schedule_index >= app.schedule.len() {
+                                        app.schedule_index = app.schedule.len().saturating_sub(1);
+                                    }
+                                    app.save_schedule();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
             Event::Mouse(mouse) => {
@@ -595,14 +688,12 @@ impl<'a> Widget for WeatherWidget<'a> {
         let inner_area = block.inner(area);
         block.render(area, buf);
 
-        // 1. Render the actual text first
         Paragraph::new(self.text)
             .alignment(ratatui::layout::Alignment::Center)
             .render(inner_area, buf);
 
         if inner_area.height == 0 || inner_area.width == 0 { return; }
 
-        // 2. Overlay the animations on empty background spaces!
         match self.condition {
             WeatherCondition::Rain | WeatherCondition::Storm => {
                 let is_storm = self.condition == WeatherCondition::Storm;
@@ -612,18 +703,17 @@ impl<'a> Widget for WeatherWidget<'a> {
                 
                 for x in inner_area.left()..inner_area.right() {
                     let col_seed = (x as u64).wrapping_mul(1103515245);
-                    if col_seed % 10 > 4 { continue; } // Rain drop density
+                    if col_seed % 10 > 4 { continue; }
                     
                     let drop_y = inner_area.top() + (((self.tick_count * speed) + col_seed % 100) % inner_area.height as u64) as u16;
                     
                     if let Some(cell) = buf.cell_mut((x, drop_y)) {
-                        if cell.symbol() == " " { // Protect the text!
+                        if cell.symbol() == " " {
                             cell.set_symbol(symbol).set_fg(color);
                         }
                     }
                 }
                 
-                // Lightning flashes for storms
                 if is_storm && self.tick_count % 80 < 2 {
                     for y in inner_area.top()..inner_area.bottom() {
                         for x in inner_area.left()..inner_area.right() {
@@ -639,11 +729,11 @@ impl<'a> Widget for WeatherWidget<'a> {
             WeatherCondition::Snow => {
                 for x in inner_area.left()..inner_area.right() {
                     let col_seed = (x as u64).wrapping_mul(123456789);
-                    if col_seed % 10 > 2 { continue; } // Snow density
+                    if col_seed % 10 > 2 { continue; } 
                     
-                    let speed = 2; // Tick divisor (slower than rain)
+                    let speed = 2; 
                     let drop_y = inner_area.top() + (((self.tick_count / speed) + col_seed % 100) % inner_area.height as u64) as u16;
-                    let drift = (self.tick_count / 4 + col_seed) % 3; // Swirl sideways
+                    let drift = (self.tick_count / 4 + col_seed) % 3; 
                     
                     let drop_x = (x + drift as u16).clamp(inner_area.left(), inner_area.right() - 1);
                     
@@ -657,7 +747,7 @@ impl<'a> Widget for WeatherWidget<'a> {
             WeatherCondition::Clouds => {
                 for y in inner_area.top()..inner_area.bottom() {
                     let row_seed = (y as u64).wrapping_mul(987654321);
-                    if row_seed % 4 != 0 { continue; } // Space out the clouds
+                    if row_seed % 4 != 0 { continue; } 
                     
                     let x_pos = inner_area.left() + (((self.tick_count / 4) + row_seed % 100) % inner_area.width as u64) as u16;
                     if let Some(cell) = buf.cell_mut((x_pos, y)) {
@@ -668,7 +758,6 @@ impl<'a> Widget for WeatherWidget<'a> {
                 }
             }
             WeatherCondition::Clear => {
-                // Subtle twinkling sunrays/stars
                 for y in inner_area.top()..inner_area.bottom() {
                     for x in inner_area.left()..inner_area.right() {
                         let seed = (x as u64).wrapping_mul(111).wrapping_add(y as u64 * 222);
@@ -687,7 +776,6 @@ impl<'a> Widget for WeatherWidget<'a> {
     }
 }
 
-// New Stock Overview Widget
 struct StockOverviewWidget<'a> { data: &'a StockOverviewData, is_selected: bool }
 impl<'a> Widget for StockOverviewWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -705,7 +793,6 @@ impl<'a> Widget for StockOverviewWidget<'a> {
         let color = if self.data.change >= 0.0 { Color::Green } else { Color::Red };
         let sign = if self.data.change >= 0.0 { "+" } else { "" };
         
-        // Removed the Market Cap portion for a cleaner look
         let header_text = format!(
             "{} ({}) \n${:.2} | {}{:.2} ({}{:.2}%)",
             self.data.symbol, self.data.company_name, 
@@ -715,7 +802,6 @@ impl<'a> Widget for StockOverviewWidget<'a> {
         Paragraph::new(ratatui::text::Span::styled(header_text, Style::default().fg(color)))
             .render(chunks[0], buf);
 
-        // Bottom Chart
         if !self.data.chart_data.is_empty() {
             let data_points: Vec<(f64, f64)> = self.data.chart_data
                 .iter()
@@ -804,6 +890,62 @@ impl<'a> Widget for FocusedViewWidget<'a> {
     }
 }
 
+struct FocusedRemindersWidget<'a> { app: &'a App }
+impl<'a> Widget for FocusedRemindersWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = standard_block(" Interactive Reminders Manager ", true);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let layout = Layout::default().direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(inner);
+
+        // List View
+        let items: Vec<ListItem> = self.app.reminders.iter().enumerate().map(|(i, r)| {
+            let sym = if r.is_done { "[x]" } else { "[ ]" };
+            let style = if i == self.app.reminder_index { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() };
+            ListItem::new(format!(" {} {}", sym, r.task)).style(style)
+        }).collect();
+        List::new(items).render(layout[0], buf);
+
+        // Input / Instruction View
+        let bottom_text = match self.app.input_mode {
+            InputMode::AddingReminder => format!("New Reminder: {}█", self.app.input_buffer),
+            _ => "Keys: [a] Add  |  [d]/[Backspace] Delete  |  [Space]/[Enter] Toggle  |  [Esc] Exit".to_string(),
+        };
+        Paragraph::new(bottom_text).block(Block::default().borders(Borders::TOP)).render(layout[1], buf);
+    }
+}
+
+struct FocusedScheduleWidget<'a> { app: &'a App }
+impl<'a> Widget for FocusedScheduleWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = standard_block(" Interactive Calendar Manager ", true);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let layout = Layout::default().direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(inner);
+
+        // List View
+        let items: Vec<ListItem> = self.app.schedule.iter().enumerate().map(|(i, s)| {
+            let style = if i == self.app.schedule_index { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default() };
+            ListItem::new(format!(" [{}] {}", s.time, s.activity)).style(style)
+        }).collect();
+        List::new(items).render(layout[0], buf);
+
+        // Input / Instruction View
+        let bottom_text = match self.app.input_mode {
+            InputMode::AddingScheduleTime => format!("Enter Time (e.g., 14:30): {}█", self.app.input_buffer),
+            InputMode::AddingScheduleActivity => format!("Time: {} | Enter Activity: {}█", self.app.temp_schedule_time, self.app.input_buffer),
+            _ => "Keys: [a] Add  |  [d]/[Backspace] Delete  |  [Esc] Exit".to_string(),
+        };
+        Paragraph::new(bottom_text).block(Block::default().borders(Borders::TOP)).render(layout[1], buf);
+    }
+}
+
 struct MatrixEdgeOverlay { tick: u64 }
 impl Widget for MatrixEdgeOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -845,8 +987,14 @@ fn ui(f: &mut Frame, app: &mut App) {
     let inner_area = if full_area.width > 20 && full_area.height > 10 { safe_area } else { full_area };
 
     if app.focused_screen != FocusedScreen::Dashboard {
-        let title = format!(" Focused: {:?} ", app.focused_screen);
-        f.render_widget(FocusedViewWidget { title: &title }, inner_area);
+        match app.focused_screen {
+            FocusedScreen::Reminders => f.render_widget(FocusedRemindersWidget { app }, inner_area),
+            FocusedScreen::Schedule => f.render_widget(FocusedScheduleWidget { app }, inner_area),
+            _ => {
+                let title = format!(" Focused: {:?} ", app.focused_screen);
+                f.render_widget(FocusedViewWidget { title: &title }, inner_area);
+            }
+        }
         f.render_widget(MatrixEdgeOverlay { tick: app.tick_count }, full_area);
         return;
     }
@@ -866,13 +1014,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(main_layout[1]);
 
-    // NEW LEFT COLUMN LAYOUT
     let left_col = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(30), // Weather
-            Constraint::Percentage(40), // Stock Chart Overview
-            Constraint::Percentage(30), // GitHub
+            Constraint::Percentage(30), 
+            Constraint::Percentage(40), 
+            Constraint::Percentage(30), 
         ])
         .split(body[0]);
 

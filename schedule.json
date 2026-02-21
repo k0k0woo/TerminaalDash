@@ -1,4 +1,14 @@
 [
-  {"time": "09:45", "activity": "Meeting"},
-  {"time": "12:15", "activity": "Attend cyber security lecture"}
+  {
+    "time": "09:45",
+    "activity": "Meeting"
+  },
+  {
+    "time": "12:15",
+    "activity": "Attend cyber security lecture"
+  },
+  {
+    "time": "13:50",
+    "activity": "Testing Code"
+  }
 ]
