@@ -1,6 +1,10 @@
 [
   {
-    "task": "Take out rubbish",
+    "task": "Sort out dataset for project",
+    "is_done": false
+  },
+  {
+    "task": "Get VLE media up to date",
     "is_done": false
   }
 ]

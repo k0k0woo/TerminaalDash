@@ -5,7 +5,8 @@ use ratatui::{
 
 use crate::{
     app::{App, FocusedScreen, SelectableWidget},
-    shared::{MatrixEdgeOverlay, TimeWidget, FocusedViewWidget},
+    shared::{TimeWidget, FocusedViewWidget},
+    overlay::{ThunderstormOverlay},
     weather::WeatherWidget,
     stocks::{StockWidget, StockOverviewWidget, FocusedStockOverviewWidget},
     github::GithubWidget,
@@ -31,7 +32,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 f.render_widget(FocusedViewWidget { title: &title }, inner_area);
             }
         }
-        f.render_widget(MatrixEdgeOverlay { tick: app.tick_count }, full_area);
+        f.render_widget(ThunderstormOverlay { tick: app.tick_count }, full_area);
         return;
     }
 
@@ -77,9 +78,9 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }, app.stock_overview_rect);
     
     f.render_widget(GithubWidget { text: &app.github_text, is_selected: sel == SelectableWidget::Github }, app.github_rect);
-    f.render_widget(NewsWidget { text: &app.news_text, is_selected: sel == SelectableWidget::News }, app.news_rect);
+    f.render_widget(NewsWidget { text: &app.news_text, is_selected: sel == SelectableWidget::News,tick_count: app.tick_count}, app.news_rect);
     f.render_widget(ScheduleWidget { schedule: &app.schedule, is_selected: sel == SelectableWidget::Schedule }, app.schedule_rect);
     f.render_widget(RemindersWidget { reminders: &app.reminders, active_idx: app.reminder_index, is_selected: sel == SelectableWidget::Reminders }, app.reminders_rect);
 
-    f.render_widget(MatrixEdgeOverlay { tick: app.tick_count }, full_area);
+    f.render_widget(ThunderstormOverlay { tick: app.tick_count }, full_area);
 }

@@ -42,7 +42,7 @@ pub async fn fetch_weather_data(tx: mpsc::Sender<AppEvent>) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(900)).await;
+        tokio::time::sleep(Duration::from_secs(300)).await;
     }
 }
 
@@ -109,7 +109,7 @@ impl<'a> Widget for WeatherWidget<'a> {
                     if row_seed % 4 != 0 { continue; } 
                     let x_pos = inner_area.left() + (((self.tick_count / 2) + row_seed % 100) % inner_area.width as u64) as u16;
                     if let Some(cell) = buf.cell_mut((x_pos, y)) {
-                        if cell.symbol() == " " { cell.set_symbol("~").set_fg(Color::DarkGray); }
+                        if cell.symbol() == " " { cell.set_symbol("~~~").set_fg(Color::DarkGray); }
                     }
                 }
             }

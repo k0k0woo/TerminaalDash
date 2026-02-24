@@ -6,6 +6,7 @@ pub mod shared;
 pub mod stocks;
 pub mod ui;
 pub mod weather;
+pub mod overlay;
 
 use app::{Action, App, AppEvent};
 use ratatui::{
